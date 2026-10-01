@@ -490,3 +490,25 @@ async def test_repeating_unexpected_error_is_logged_once(hass: HomeAssistant, mo
         assert hass.states.get("binary_sensor.airsense_12345678901_connected").state == "on"  # third attempt
         assert len(_integration_log(caplog, logging.ERROR)) == 1
         assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_night_history_lists_every_day_the_machine_returned(hass: HomeAssistant, mock_ble) -> None:
+    """The other last-night sensors only show the latest night; a chart needs all of them, unused days included."""
+    next_day, unused_day = DAY + 86_400_000, DAY + 2 * 86_400_000
+    _spools_with(mock_ble, Summary=b"".join([
+        summary_day(DAY, 313, [(DAY + 51_480_000, 38), (DAY + 53_880_000, 275)]),
+        summary_day(next_day, 420, [(next_day + 51_480_000, 420)]),
+        field(2, field(1, 1) + field(2, unused_day) + field(3, unused_day + 86_400_000) + field(5, 0)),
+    ]))
+    entry = _entry(hass)
+    with patch("custom_components.resmed_airsense.coordinator.KEEPALIVE_INTERVAL", 3600):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        history = hass.states.get("sensor.airsense_12345678901_night_history")
+        assert history.state == "2"  # nights with use
+        assert history.attributes["nights"] == [
+            {"start": "2026-09-23T11:00:00+00:00", "usage_hours": 5.22, "ahi": 0.9, "leak_p95": 26.4, "mask_on": 2},
+            {"start": "2026-09-24T11:00:00+00:00", "usage_hours": 7.0, "ahi": 0.9, "leak_p95": 26.4, "mask_on": 1},
+            {"start": "2026-09-25T11:00:00+00:00", "usage_hours": 0.0, "ahi": None, "leak_p95": None, "mask_on": 0},
+        ]
+        assert await hass.config_entries.async_unload(entry.entry_id)

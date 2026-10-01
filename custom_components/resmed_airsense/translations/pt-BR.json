@@ -70,6 +70,9 @@
       "night_date": {
         "name": "Última noite"
       },
+      "night_history": {
+        "name": "Histórico de noites"
+      },
       "usage": {
         "name": "Uso"
       },

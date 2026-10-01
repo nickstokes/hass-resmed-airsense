@@ -83,6 +83,20 @@ def _lpm(stats: str, key: str) -> Callable[[AirSenseData], Any]:
     return _night(lambda n: round(v * 60, 1) if (v := getattr(n, stats).get(key)) is not None else None)
 
 
+def _nights(d: AirSenseData) -> list[dict[str, Any]]:
+    """Every day record the machine returned (oldest first, unused days included), for charts."""
+    return [
+        {
+            "start": n.day_start.isoformat(),
+            "usage_hours": n.usage_hours,
+            "ahi": n.ahi,
+            "leak_p95": round(v * 60, 1) if (v := n.leak_lps.get("p95")) is not None else None,  # L/min
+            "mask_on": n.mask_on_count,
+        }
+        for n in d.days
+    ]
+
+
 def _live(key: str, scale: float = 1.0) -> Callable[[AirSenseData], Any]:
     return lambda d: round(v * scale, 2) if (v := d.live.get(key)) is not None else None
 
@@ -180,6 +194,9 @@ SENSORS: tuple[AirSenseSensorDescription, ...] = (
       value_fn=_night(lambda n: n.sessions[0].start if n.sessions else n.day_start),
       attrs_fn=lambda d: {"sessions": [{"start": s.start.isoformat(), "minutes": s.minutes} for s in d.last_night.sessions]}
       if d.last_night else None),
+    D(key="night_history", translation_key="night_history",
+      value_fn=lambda d: sum(1 for n in d.days if n.usage_minutes) if d.days else None,  # nights with use
+      attrs_fn=lambda d: {"nights": _nights(d)}),
     D(key="usage", translation_key="usage", value_fn=_night(lambda n: n.usage_hours), device_class=SensorDeviceClass.DURATION,
       native_unit_of_measurement=UnitOfTime.HOURS, suggested_display_precision=1),
     D(key="mask_on_count", translation_key="mask_on_count", value_fn=_night(lambda n: n.mask_on_count)),

@@ -70,6 +70,9 @@
       "night_date": {
         "name": "Last night"
       },
+      "night_history": {
+        "name": "Night history"
+      },
       "usage": {
         "name": "Usage"
       },
