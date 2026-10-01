@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -20,7 +22,7 @@ from custom_components.resmed_airsense.const import (
     EVENT_THERAPY_STOPPED,
 )
 from custom_components.resmed_airsense.resmed_air_ble import AuthError, Credentials
-from pbwrite import cloud_session, soundcheck_run, summary_day
+from pbwrite import cloud_session, field, soundcheck_run, summary_day
 
 ADDR = "AA:BB:CC:DD:EE:FF"
 INFO = BluetoothServiceInfo(
@@ -327,4 +329,164 @@ async def test_spool_read_retries_after_lost_fragment(hass: HomeAssistant, mock_
         await hass.async_block_till_done()
         assert calls["CellularActivityEvents"] == 3
         assert hass.states.get("sensor.airsense_12345678901_cloud_upload_status").state == "ok"
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+# a day record whose CSR field (16) arrives length-delimited instead of as a number: the kind of layout
+# difference another model or firmware can have
+ODD_SUMMARY = field(2, field(5, 60) + field(16, b"\x00"))
+
+
+def _spools_with(mock_ble, **odd: bytes):
+    """Replaces the named spools of the fake machine, keeping the others."""
+    good = mock_ble.spool.side_effect
+    mock_ble.spool.side_effect = lambda address, since: odd[address] if address in odd else good(address, since)
+
+
+async def test_undecodable_summary_keeps_the_link_and_the_other_logs(hass: HomeAssistant, mock_ble) -> None:
+    """Regression (v0.1.1): a Summary record the decoder tripped over ended the connection task for good."""
+    _spools_with(mock_ble, Summary=ODD_SUMMARY)
+    entry = _entry(hass)
+    with patch("custom_components.resmed_airsense.coordinator.KEEPALIVE_INTERVAL", 3600):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        state = lambda e: hass.states.get(f"sensor.airsense_12345678901_{e}").state  # noqa: E731
+        assert hass.states.get("binary_sensor.airsense_12345678901_connected").state == "on"
+        assert state("ahi") == "unavailable"
+        assert state("cloud_upload_status") == "ok"  # the logs read right after the summary still arrive
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+def _integration_log(caplog, level: int) -> list[str]:
+    return [r.getMessage() for r in caplog.records
+            if r.levelno == level and r.name.startswith("custom_components.resmed_airsense")]
+
+
+async def test_undecodable_log_is_reported_once(hass: HomeAssistant, mock_ble, caplog) -> None:
+    """Missing last-night sensors need an explanation in the log, but not one per retry."""
+    _spools_with(mock_ble, Summary=ODD_SUMMARY)
+    entry = _entry(hass)
+    with (
+        patch("custom_components.resmed_airsense.coordinator.KEEPALIVE_INTERVAL", 3600),
+        patch("custom_components.resmed_airsense.coordinator.SUMMARY_RETRY", 0),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        mock_ble.on_event("FGState", "Therapy", {})  # wakes the session loop, which retries the summary
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert sum(1 for c in mock_ble.spool.call_args_list if c.args[0] == "Summary") >= 2
+        assert len([m for m in _integration_log(caplog, logging.WARNING) if "Summary" in m]) == 1
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+# an upload event / a SoundCheck vector whose timestamp arrives length-delimited instead of as a number
+ODD_UPLOADS = field(12, field(1, {1: 23, 2: b"x"}))
+ODD_SOUNDCHECK = field(15, {1: b"x"})
+
+
+@pytest.mark.parametrize(
+    ("log", "raw", "upload_status"),
+    [("CellularActivityEvents", ODD_UPLOADS, "unavailable"), ("SoundcheckVector", ODD_SOUNDCHECK, "ok")],
+    ids=["uploads", "soundcheck"],
+)
+async def test_undecodable_device_log_keeps_the_session_loop_running(
+    hass: HomeAssistant, mock_ble, log: str, raw: bytes, upload_status: str
+) -> None:
+    _spools_with(mock_ble, **{log: raw})
+    entry = _entry(hass)
+    with patch("custom_components.resmed_airsense.coordinator.KEEPALIVE_INTERVAL", 3600):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        state = lambda e: hass.states.get(f"sensor.airsense_12345678901_{e}").state  # noqa: E731
+        assert state("ahi") == "0.9" and state("humidity_level") == "6"
+        assert state("cloud_upload_status") == upload_status
+        # the loop still reacts: a setting changed on the machine is re-read
+        changed = copy.deepcopy(GET["SettingProfiles"])
+        changed["FeatureProfiles"]["ClimateFeature"]["HumidifierLevel"] = 4
+        mock_ble.on_event("HumidifierLevel", 6, {})
+        with patch.dict(GET, {"SettingProfiles": changed}):
+            mock_ble.on_event("HumidifierLevel", 4, {})
+            for _ in range(10):
+                await asyncio.sleep(0)
+        assert state("humidity_level") == "4"
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_undecodable_stored_summary_does_not_block_setup(hass: HomeAssistant, mock_ble, hass_storage) -> None:
+    import base64
+
+    entry = _entry(hass)
+    hass_storage[f"{DOMAIN}.{entry.entry_id}"] = {
+        "version": 1,
+        "key": f"{DOMAIN}.{entry.entry_id}",
+        "data": {
+            "settings": GET["SettingProfiles"],
+            "metrics": GET["MachineMetrics"],
+            "identity": {},
+            "version": {},
+            "summary": base64.b64encode(ODD_SUMMARY).decode(),
+        },
+    }
+    with patch("custom_components.resmed_airsense.coordinator.bluetooth.async_ble_device_from_address", return_value=None):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        state = lambda e: hass.states.get(f"sensor.airsense_12345678901_{e}").state  # noqa: E731
+        assert state("therapy_mode") == "AutoSet" and state("ahi") == "unavailable"
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_unexpected_error_in_a_session_reconnects(hass: HomeAssistant, mock_ble) -> None:
+    """Regression (v0.1.1): anything but a link/protocol error (here: a handshake reply without its nonce)
+    ended the connection task for good, and the entry could not even be unloaded afterwards."""
+    mock_ble.open_session.side_effect = [KeyError("nonce"), None]
+    entry = _entry(hass)
+    with (
+        patch("custom_components.resmed_airsense.coordinator.RECONNECT_BACKOFF", (0, 0, 0, 0, 0)),
+        patch("custom_components.resmed_airsense.coordinator.KEEPALIVE_INTERVAL", 3600),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        for _ in range(50):
+            await asyncio.sleep(0)
+        await hass.async_block_till_done()
+        assert hass.states.get("binary_sensor.airsense_12345678901_connected").state == "on"
+        assert hass.states.get("sensor.airsense_12345678901_ahi").state == "0.9"
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_unexpected_error_waits_out_the_backoff(hass: HomeAssistant, mock_ble) -> None:
+    """Such an error repeats on every attempt, and the machine advertises again as soon as the link drops:
+    reconnecting on that advertisement (as after a lost link) would hammer it every few seconds."""
+    mock_ble.open_session.side_effect = KeyError("nonce")
+    advertised = []
+    entry = _entry(hass)
+    with (
+        patch("custom_components.resmed_airsense.coordinator.bluetooth.async_register_callback",
+              side_effect=lambda _hass, callback, *_: (advertised.append(callback), lambda: None)[1]),
+        patch("custom_components.resmed_airsense.coordinator.RECONNECT_BACKOFF", (3600,) * 5),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert mock_ble.open_session.await_count == 1
+        advertised[0](MagicMock(), MagicMock())
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert mock_ble.open_session.await_count == 1
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_repeating_unexpected_error_is_logged_once(hass: HomeAssistant, mock_ble, caplog) -> None:
+    mock_ble.open_session.side_effect = [KeyError("nonce"), KeyError("nonce"), None]
+    entry = _entry(hass)
+    with (
+        patch("custom_components.resmed_airsense.coordinator.RECONNECT_BACKOFF", (0, 0, 0, 0, 0)),
+        patch("custom_components.resmed_airsense.coordinator.KEEPALIVE_INTERVAL", 3600),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        for _ in range(80):
+            await asyncio.sleep(0)
+        await hass.async_block_till_done()
+        assert hass.states.get("binary_sensor.airsense_12345678901_connected").state == "on"  # third attempt
+        assert len(_integration_log(caplog, logging.ERROR)) == 1
         assert await hass.config_entries.async_unload(entry.entry_id)

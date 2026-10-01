@@ -84,6 +84,7 @@ class AirSenseCoordinator:
         # last known non-live data, so sensors survive restarts and out-of-range periods
         self._store: Store[dict[str, Any]] = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}")
         self._summary_raw: str | None = None  # base64 of the last Summary spool
+        self._undecodable: set[str] = set()  # logs already reported as not understood
 
     # ---- lifecycle ----------------------------------------------------------------------
 
@@ -121,7 +122,7 @@ class AirSenseCoordinator:
         if summary := stored.get("summary"):
             self._summary_raw = summary
             with contextlib.suppress(ValueError, IndexError):
-                self._set_days(parse_summary_spool(base64.b64decode(summary)))
+                self._set_days(self._decode("Summary", parse_summary_spool, base64.b64decode(summary)))
 
     def _save(self, summary: bytes | None = None) -> None:
         if summary is not None:
@@ -169,7 +170,9 @@ class AirSenseCoordinator:
     async def _run(self) -> None:
         attempt = 0
         rejected = 0  # consecutive explicit rejections
+        reported = ""  # last unexpected error logged
         while True:
+            unexpected = False
             try:
                 await self._session()
                 attempt = rejected = 0
@@ -185,10 +188,20 @@ class AirSenseCoordinator:
                               self.address, err)
             except (AirSenseError, BleakError, TimeoutError) as err:
                 _LOGGER.debug("%s: link lost: %s", self.address, err)
+            except Exception as err:  # noqa: BLE001 - a bug or an unforeseen reply must not end the link for good
+                unexpected = True
+                if repr(err) != reported:  # the same one again every backoff period would flood the log
+                    reported = repr(err)
+                    _LOGGER.exception("%s: unexpected error; reconnecting", self.address)
             self._set_connected(False)
             self._clear_live()
             delay = RECONNECT_BACKOFF[min(attempt, len(RECONNECT_BACKOFF) - 1)]
             attempt += 1
+            if unexpected:
+                # it would repeat on every attempt, and the device advertises as soon as the link drops:
+                # sit the backoff out instead of reconnecting on that advertisement
+                await asyncio.sleep(delay)
+                continue
             # the device is silent on BLE while idle; wake up early when it advertises again
             self._seen.clear()
             with contextlib.suppress(TimeoutError):
@@ -298,10 +311,22 @@ class AirSenseCoordinator:
                     raise
                 attempt += 1
 
+    def _decode(self, log: str, parser: Callable[[bytes], Any], raw: bytes) -> Any:
+        """Runs a log decoder. The log formats are undocumented and were worked out on one model, so whatever
+        the decoder trips over on another machine means "not understood": a ValueError, which callers handle."""
+        try:
+            return parser(raw)
+        except Exception as err:  # noqa: BLE001 - a decoder bug must not take the link down
+            if log not in self._undecodable:  # the read is retried; say it once
+                self._undecodable.add(log)
+                _LOGGER.warning("%s: %s log not understood (%r); its sensors keep their previous values",
+                                self.address, log, err)
+            raise ValueError(f"{log} log not understood: {err!r}") from err
+
     async def _refresh_summary(self, client: AirSenseClient) -> bool:
         try:
             raw = await self._spool(client, "Summary", SUMMARY_DAYS)
-            days = parse_summary_spool(raw)
+            days = self._decode("Summary", parse_summary_spool, raw)
         except (AirSenseError, ValueError, IndexError):
             return False
         if days:
@@ -313,9 +338,11 @@ class AirSenseCoordinator:
     async def _refresh_logs(self, client: AirSenseClient) -> None:
         """Cloud upload + SoundCheck logs; best effort (a failure just keeps the previous values)."""
         try:
-            if uploads := parse_cloud_uploads(await self._spool(client, "CellularActivityEvents", 7)):
+            raw = await self._spool(client, "CellularActivityEvents", 7)
+            if uploads := self._decode("CellularActivityEvents", parse_cloud_uploads, raw):
                 self.data.last_upload = uploads[-1]
-            if checks := parse_soundchecks(await self._spool(client, "SoundcheckVector", 15)):
+            raw = await self._spool(client, "SoundcheckVector", 15)
+            if checks := self._decode("SoundcheckVector", parse_soundchecks, raw):
                 self.data.last_soundcheck = checks[-1]
         except (AirSenseError, ValueError, IndexError) as err:
             _LOGGER.debug("%s: log spools failed: %s", self.address, err)
